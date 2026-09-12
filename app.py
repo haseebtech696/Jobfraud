@@ -772,7 +772,8 @@ if analyze_clicked:
         st.caption(f"Extraction confidence: {confidence}% (method: {fetch_result['method']}{' + OCR' if ocr_used else ''})")
 
     if ai_result.get("error"):
-        st.warning(f"AI analysis unavailable: {ai_result['error']}")
+        st.warning("AI analysis unavailable:")
+        st.code(ai_result["error"], language=None)
 
     st.subheader("Why this score")
     all_findings = list(rule_flags)
