@@ -1,0 +1,11 @@
+streamlit>=1.36
+requests>=2.31
+beautifulsoup4>=4.12
+lxml>=5.2
+trafilatura>=1.8
+extruct>=0.17
+w3lib>=2.1
+playwright>=1.45
+pytesseract>=0.3.10
+Pillow>=10.3
+openai>=1.30
