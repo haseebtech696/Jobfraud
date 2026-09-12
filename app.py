@@ -7,7 +7,7 @@ explainable 0-100 fraud-risk score, combining:
   2. A browser fallback (Playwright) with screenshot + OCR (pytesseract) for
      JavaScript-heavy pages that the direct method can't read
   3. A rule-based fraud checklist (company / contact / description / application signals)
-  4. An AI review using the Grok API (xAI, OpenAI-compatible endpoint)
+  4. An AI review using the Groq API (groq.com, OpenAI-compatible endpoint)
 
 Deployment note: the Playwright + OCR fallback needs OS-level libraries
 (a Chromium runtime and the `tesseract-ocr` binary) that pip alone cannot
@@ -60,11 +60,11 @@ except Exception:
 APP_TITLE = "JabFraud"
 APP_TAGLINE = "Check the job before you apply."
 
-# xAI's Grok endpoint is OpenAI-compatible.
-GROK_BASE_URL = "https://api.x.ai/v1"
-# Model names change fairly often on xAI's side — override via
-# st.secrets["GROK_MODEL"] if this stops being valid.
-DEFAULT_GROK_MODEL = "grok-4-fast-reasoning"
+# Groq's endpoint is OpenAI-compatible.
+GROQ_BASE_URL = "https://api.groq.com/openai/v1"
+# Model names change fairly often on Groq's side — override via
+# st.secrets["GROQ_MODEL"] if this stops being valid. See console.groq.com/docs/models.
+DEFAULT_GROQ_MODEL = "openai/gpt-oss-120b"
 
 REQUEST_TIMEOUT = 15
 USER_AGENT = (
@@ -324,8 +324,9 @@ def _text_of(value):
 EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}")
 PHONE_RE = re.compile(r"(?:\+?\d{1,3}[\s.-]?)?(?:\(?\d{2,4}\)?[\s.-]?){2,4}\d{3,4}")
 SALARY_RE = re.compile(
-    r"(?:\$|USD|PKR|Rs\.?|₹|£|€)\s?[\d,]+(?:\.\d+)?\s?(?:-|to)?\s?(?:\$|USD|PKR|Rs\.?|₹|£|€)?\s?[\d,]*\s*"
-    r"(?:/\s?(?:year|yr|month|mo|hour|hr))?",
+    r"(?:\$|₹|£|€|\bUSD\b|\bPKR\b|\bRs\.?\b)\s?\d[\d,]*(?:\.\d+)?"
+    r"(?:\s*(?:-|to)\s*(?:\$|₹|£|€|\bUSD\b|\bPKR\b|\bRs\.?\b)?\s?\d[\d,]*)?"
+    r"\s*(?:/\s?(?:year|yr|month|mo|hour|hr))?",
     re.IGNORECASE,
 )
 
@@ -376,6 +377,20 @@ def parse_job_fields(fetch_result: dict, original_url: str) -> dict:
     if not company and soup:
         og_site = soup.find("meta", property="og:site_name")
         company = og_site["content"].strip() if og_site and og_site.get("content") else ""
+    if not company and soup:
+        # Many ATS platforms (Greenhouse, Lever, etc.) render a "<Company> Logo"
+        # alt text on the header image even when no other structured data exists.
+        logo_img = soup.find("img", alt=re.compile(r"logo", re.IGNORECASE))
+        if logo_img and logo_img.get("alt"):
+            m = re.match(r"^(.*?)\s*logo\s*$", logo_img["alt"].strip(), re.IGNORECASE)
+            if m and m.group(1):
+                company = m.group(1).strip()
+    if not company:
+        # Common ATS title pattern: "Job Application for <Title> at <Company>"
+        page_title = soup.title.text.strip() if soup and soup.title else ""
+        m = re.search(r"\bat\s+([A-Z][\w&.,'\-]*(?:\s+[A-Z][\w&.,'\-]*){0,4})\s*$", page_title)
+        if m:
+            company = m.group(1).strip()
     if not company:
         company = urlparse(final_url).netloc.replace("www.", "")
 
@@ -413,7 +428,7 @@ def parse_job_fields(fetch_result: dict, original_url: str) -> dict:
     domain = urlparse(final_url).netloc
 
     # --- experience / skills / benefits (simple keyword heuristics over description) ---
-    exp_match = re.search(r"(\d+)\+?\s*(?:-\s*\d+\s*)?years?\s+(?:of\s+)?experience", description, re.IGNORECASE)
+    exp_match = re.search(r"\d+\+?(?:\s*[-–to]+\s*\d+\+?)?\s*years?\b", description, re.IGNORECASE)
     experience = exp_match.group(0) if exp_match else ""
 
     skill_keywords = [
@@ -559,14 +574,20 @@ def run_rule_checklist(job: dict) -> tuple:
 
 
 # --------------------------------------------------------------------------
-# Stage 3b — AI analysis (Grok / xAI)
+# Stage 3b — AI analysis (Groq)
 # --------------------------------------------------------------------------
 
-def get_grok_client():
-    api_key = st.session_state.get("grok_api_key") or st.secrets.get("GROK_API_KEY", "")
+def get_groq_client():
+    # Accepts GROQ_API_KEY (correct name) and falls back to a legacy
+    # GROK_API_KEY secret name for anyone who already set that up.
+    api_key = (
+        st.session_state.get("groq_api_key")
+        or st.secrets.get("GROQ_API_KEY", "")
+        or st.secrets.get("GROK_API_KEY", "")
+    )
     if not api_key or not OPENAI_SDK_AVAILABLE:
         return None
-    return OpenAI(api_key=api_key, base_url=GROK_BASE_URL)
+    return OpenAI(api_key=api_key, base_url=GROQ_BASE_URL)
 
 
 AI_SYSTEM_PROMPT = (
@@ -581,16 +602,16 @@ AI_SYSTEM_PROMPT = (
 
 
 def run_ai_analysis(job: dict) -> dict:
-    """Calls the Grok API and returns {risk_score, findings, recommendation, error}."""
-    client = get_grok_client()
+    """Calls the Groq API and returns {risk_score, findings, recommendation, error}."""
+    client = get_groq_client()
     if client is None:
         return {
             "risk_score": None, "findings": [], "recommendation": "",
-            "error": "No Grok API key configured. Add GROK_API_KEY in Streamlit secrets "
+            "error": "No Groq API key configured. Add GROQ_API_KEY in Streamlit secrets "
                      "or enter it in the sidebar to enable AI analysis.",
         }
 
-    model = st.secrets.get("GROK_MODEL", DEFAULT_GROK_MODEL)
+    model = st.secrets.get("GROQ_MODEL", DEFAULT_GROQ_MODEL)
     payload = {
         "title": job.get("title"),
         "company": job.get("company"),
@@ -626,23 +647,23 @@ def run_ai_analysis(job: dict) -> dict:
         return {"risk_score": risk_score, "findings": findings, "recommendation": recommendation, "error": None}
     except json.JSONDecodeError:
         return {"risk_score": None, "findings": [], "recommendation": "",
-                "error": "Grok responded, but not with valid JSON. The model may not support "
-                         "structured JSON output — try a different GROK_MODEL."}
+                "error": "Groq responded, but not with valid JSON. The model may not support "
+                         "structured JSON output — try a different GROQ_MODEL."}
     except Exception as e:
         try:
             import openai as _openai_mod
             if isinstance(e, _openai_mod.AuthenticationError):
-                msg = "Authentication failed — check that the Grok API key is correct."
+                msg = "Authentication failed — check that the Groq API key is correct."
             elif isinstance(e, _openai_mod.NotFoundError):
-                msg = f"Model '{model}' was not found by the API — check GROK_MODEL is a valid, current xAI model name."
+                msg = f"Model '{model}' was not found by the API — check GROQ_MODEL is a valid, current Groq model name (see console.groq.com/docs/models)."
             elif isinstance(e, _openai_mod.RateLimitError):
-                msg = "Rate limited by xAI — you're sending requests too fast or are out of quota."
+                msg = "Rate limited by Groq — you're sending requests too fast or are out of quota."
             elif isinstance(e, _openai_mod.APIConnectionError):
-                msg = ("Couldn't reach api.x.ai at all (network/firewall/VPN/proxy issue on this "
+                msg = ("Couldn't reach api.groq.com at all (network/firewall/VPN/proxy issue on this "
                        "machine, or no outbound internet access) — this happens before the API "
                        "key is even checked.")
             elif isinstance(e, _openai_mod.APIStatusError):
-                msg = f"xAI API returned an error (HTTP {e.status_code}): {getattr(e, 'message', str(e))}"
+                msg = f"Groq API returned an error (HTTP {e.status_code}): {getattr(e, 'message', str(e))}"
             else:
                 msg = str(e)
         except Exception:
@@ -679,14 +700,14 @@ st.set_page_config(page_title="JabFraud — Check the job before you apply.", pa
 
 with st.sidebar:
     st.markdown("### Settings")
-    secret_key_present = bool(st.secrets.get("GROK_API_KEY", ""))
+    secret_key_present = bool(st.secrets.get("GROQ_API_KEY", "") or st.secrets.get("GROK_API_KEY", ""))
     if secret_key_present:
-        st.success("Grok API key loaded from Streamlit secrets.")
+        st.success("Groq API key loaded from Streamlit secrets.")
     else:
-        st.session_state["grok_api_key"] = st.text_input(
-            "Grok API key (xAI)", type="password",
+        st.session_state["groq_api_key"] = st.text_input(
+            "Groq API key (groq.com)", type="password",
             help="Not stored anywhere except this browser session. "
-                 "For a permanent setup, add GROK_API_KEY to Streamlit secrets instead.",
+                 "For a permanent setup, add GROQ_API_KEY to Streamlit secrets instead.",
         )
     st.caption(
         "Playwright/OCR fallback needs OS packages (Chromium libs, tesseract-ocr) "
