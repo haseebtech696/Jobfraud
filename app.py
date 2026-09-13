@@ -946,6 +946,59 @@ def parse_job_fields(
                 "content"
             ]
 
+    # Many ATS platforms (Greenhouse in particular) put the location in
+    # the og:description meta tag as a short "City, Country" string,
+    # since there's no separate structured location field on the page.
+    if not location and soup:
+
+        og_desc = soup.find(
+            "meta",
+            property="og:description",
+        )
+
+        if (
+            og_desc
+            and og_desc.get("content")
+        ):
+            candidate = og_desc["content"].strip()
+
+            if (
+                candidate
+                and len(candidate) < 60
+                and "," in candidate
+                and not any(ch.isdigit() for ch in candidate)
+            ):
+                location = candidate
+
+    # Last resort: scan the first few lines of visible text for something
+    # that looks like a bare "City, Country" line — common right under the
+    # job title on pages that don't expose location any other way.
+    if not location and text:
+
+        candidate_lines = [
+            ln.strip()
+            for ln in text.split("\n")[:6]
+            if ln.strip()
+        ]
+
+        for line in candidate_lines:
+
+            words = [
+                w for w in re.split(r"[,\s]+", line) if w
+            ]
+
+            looks_like_location = (
+                0 < len(line) < 60
+                and "," in line
+                and not any(ch.isdigit() for ch in line)
+                and words
+                and all(w[0].isupper() for w in words)
+            )
+
+            if looks_like_location:
+                location = line
+                break
+
     # ------------------------------------------------------------------
     # Company extraction
     # ------------------------------------------------------------------
@@ -1231,11 +1284,19 @@ def parse_job_fields(
         "linux",
     ]
 
+    # Word-boundary matching, not plain substring: a plain "in" check would
+    # match "ai" inside "trading" or "git" inside "digital", which produced
+    # false-positive skills on real postings.
+    description_lower = description.lower()
+
     skills_found = sorted(
         {
             kw
             for kw in skill_keywords
-            if kw in description.lower()
+            if re.search(
+                r"\b" + re.escape(kw) + r"\b",
+                description_lower,
+            )
         }
     )
 
@@ -1261,7 +1322,10 @@ def parse_job_fields(
         {
             kw
             for kw in benefit_keywords
-            if kw in description.lower()
+            if re.search(
+                r"\b" + re.escape(kw) + r"\b",
+                description_lower,
+            )
         }
     )
 
