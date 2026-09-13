@@ -30,8 +30,11 @@ import io
 import json
 import os
 import re
+import random
 import subprocess
 import sys
+import time
+from datetime import datetime
 from urllib.parse import urljoin, urlparse
 
 import requests
@@ -84,11 +87,26 @@ DEFAULT_GROQ_MODEL = "openai/gpt-oss-120b"
 
 REQUEST_TIMEOUT = 15
 
-USER_AGENT = (
+# A small pool of realistic desktop User-Agent strings. Rotating between
+# these (instead of always sending the same one) reduces the odds of
+# tripping the simplest User-Agent-based bot blocks.
+USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/124.0 Safari/537.36 JabFraud/1.0"
-)
+    "Chrome/124.0 Safari/537.36 JabFraud/1.0",
+
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/605.1.15 (KHTML, like Gecko) "
+    "Version/17.4 Safari/605.1.15",
+
+    "Mozilla/5.0 (X11; Linux x86_64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0 Safari/537.36",
+]
+
+
+def _random_user_agent() -> str:
+    return random.choice(USER_AGENTS)
 
 
 FREE_EMAIL_DOMAINS = {
@@ -261,7 +279,14 @@ def ensure_chromium_installed() -> bool:
 # --------------------------------------------------------------------------
 
 def fetch_direct(url: str) -> dict:
-    """Direct HTTP extraction without JavaScript."""
+    """
+    Direct HTTP extraction without JavaScript.
+
+    Retries transient failures (timeouts, connection resets, and 502/503/504
+    responses) a couple of times with a short backoff before giving up, and
+    rotates the User-Agent on each attempt. This is a best-effort measure —
+    it will not get past real bot-protection, only real slowness/blips.
+    """
 
     out = {
         "method": "direct",
@@ -273,77 +298,101 @@ def fetch_direct(url: str) -> dict:
         "status_code": None,
         "redirect_chain": [],
         "error": None,
+        "attempts": 0,
     }
 
-    try:
-        resp = requests.get(
-            url,
-            headers={
-                "User-Agent": USER_AGENT,
-                "Accept": (
-                    "text/html,application/xhtml+xml,"
-                    "application/xml;q=0.9,*/*;q=0.8"
-                ),
-            },
-            timeout=REQUEST_TIMEOUT,
-            allow_redirects=True,
-        )
+    max_attempts = 3
+    retryable_status = {502, 503, 504}
 
-        out["status_code"] = resp.status_code
-        out["final_url"] = resp.url
-        out["redirect_chain"] = [r.url for r in resp.history]
+    last_error = None
 
-        if resp.status_code >= 400:
-            out["error"] = f"HTTP {resp.status_code}"
+    for attempt in range(1, max_attempts + 1):
+
+        out["attempts"] = attempt
+
+        try:
+            resp = requests.get(
+                url,
+                headers={
+                    "User-Agent": _random_user_agent(),
+                    "Accept": (
+                        "text/html,application/xhtml+xml,"
+                        "application/xml;q=0.9,*/*;q=0.8"
+                    ),
+                },
+                timeout=REQUEST_TIMEOUT,
+                allow_redirects=True,
+            )
+
+            out["status_code"] = resp.status_code
+            out["final_url"] = resp.url
+            out["redirect_chain"] = [r.url for r in resp.history]
+
+            if resp.status_code in retryable_status and attempt < max_attempts:
+                last_error = f"HTTP {resp.status_code}"
+                time.sleep(0.6 * attempt)
+                continue
+
+            if resp.status_code >= 400:
+                out["error"] = f"HTTP {resp.status_code}"
+                return out
+
+            html = resp.text
+            out["html"] = html
+
+            extracted_text = trafilatura.extract(
+                html,
+                url=resp.url,
+            ) or ""
+
+            out["text"] = extracted_text.strip()
+
+            if EXTRUCT_AVAILABLE:
+                try:
+                    base_url = get_base_url(
+                        html,
+                        resp.url,
+                    )
+
+                    data = extruct.extract(
+                        html,
+                        base_url=base_url,
+                        syntaxes=["json-ld", "microdata"],
+                    )
+
+                    out["structured"] = data
+
+                except Exception:
+                    out["structured"] = {}
+
+            has_structured_job = (
+                _find_jobposting(out["structured"]) is not None
+            )
+
+            # We deliberately require meaningful content.
+            out["success"] = (
+                len(out["text"]) > 200
+                or has_structured_job
+            )
+
             return out
 
-        html = resp.text
-        out["html"] = html
+        except requests.RequestException as e:
+            last_error = str(e)
 
-        extracted_text = trafilatura.extract(
-            html,
-            url=resp.url,
-        ) or ""
+            if attempt < max_attempts:
+                time.sleep(0.6 * attempt)
+                continue
 
-        out["text"] = extracted_text.strip()
+            out["error"] = last_error
+            return out
 
-        if EXTRUCT_AVAILABLE:
-            try:
-                base_url = get_base_url(
-                    html,
-                    resp.url,
-                )
+        except Exception as e:
+            out["error"] = str(e)
+            return out
 
-                data = extruct.extract(
-                    html,
-                    base_url=base_url,
-                    syntaxes=["json-ld", "microdata"],
-                )
-
-                out["structured"] = data
-
-            except Exception:
-                out["structured"] = {}
-
-        has_structured_job = (
-            _find_jobposting(out["structured"]) is not None
-        )
-
-        # We deliberately require meaningful content.
-        out["success"] = (
-            len(out["text"]) > 200
-            or has_structured_job
-        )
-
-        return out
-
-    except requests.RequestException as e:
-        out["error"] = str(e)
-        return out
-
-    except Exception as e:
-        out["error"] = str(e)
-        return out
+    out["error"] = last_error or "Request failed after retries."
+    return out
 
 
 def fetch_with_browser(url: str) -> dict:
@@ -384,7 +433,7 @@ def fetch_with_browser(url: str) -> dict:
             )
 
             page = browser.new_page(
-                user_agent=USER_AGENT,
+                user_agent=_random_user_agent(),
                 viewport={
                     "width": 1366,
                     "height": 900,
@@ -1304,12 +1353,18 @@ def compute_extraction_confidence(
 
 def run_rule_checklist(
     job: dict,
+    history: list = None,
 ) -> tuple:
 
     """
     Returns:
         rule_score 0-100
-        flags
+        flags (each with a "category" and "severity" for grouped display)
+
+    `history` is the optional in-session list of previously analyzed jobs
+    (see the sidebar history feature). When provided, a recruiter email or
+    application domain that has already shown up under a *different*
+    company name in this session is flagged as reused.
     """
 
     flags = []
@@ -1321,22 +1376,39 @@ def run_rule_checklist(
         + job.get("raw_text", "")
     ).lower()
 
+    def add_flag(icon, title, detail, category, points):
+        severity = (
+            "high" if points >= 25
+            else "medium" if points >= 12
+            else "low"
+        )
+
+        flags.append(
+            {
+                "icon": icon,
+                "title": title,
+                "detail": detail,
+                "category": category,
+                "severity": severity,
+            }
+        )
+
     # ------------------------------------------------------------------
     # Page/extraction quality
     # ------------------------------------------------------------------
 
     if job.get("looks_like_listing_page"):
 
-        flags.append(
-            {
-                "icon": "⚠",
-                "title": "Job listing page detected",
-                "detail": (
-                    "This appears to contain multiple jobs rather "
-                    "than one specific posting. Fraud analysis may "
-                    "be unreliable until a specific job URL is used."
-                ),
-            }
+        add_flag(
+            "⚠",
+            "Job listing page detected",
+            (
+                "This appears to contain multiple jobs rather "
+                "than one specific posting. Fraud analysis may "
+                "be unreliable until a specific job URL is used."
+            ),
+            "Page Quality",
+            5,
         )
 
         score += 5
@@ -1352,15 +1424,15 @@ def run_rule_checklist(
 
     if not company or company.lower() == "unknown":
 
-        flags.append(
-            {
-                "icon": "⚠",
-                "title": "Employer could not be verified",
-                "detail": (
-                    "The page did not provide a clearly identifiable "
-                    "employer name."
-                ),
-            }
+        add_flag(
+            "⚠",
+            "Employer could not be verified",
+            (
+                "The page did not provide a clearly identifiable "
+                "employer name."
+            ),
+            "Company",
+            8,
         )
 
         score += 8
@@ -1380,15 +1452,15 @@ def run_rule_checklist(
             for free in FREE_WEBSITE_HOSTS
         ):
 
-            flags.append(
-                {
-                    "icon": "⚠",
-                    "title": "Company site uses a free website builder",
-                    "detail": (
-                        f"The listed company website ({host}) "
-                        "uses a free website-builder domain."
-                    ),
-                }
+            add_flag(
+                "⚠",
+                "Company site uses a free website builder",
+                (
+                    f"The listed company website ({host}) "
+                    "uses a free website-builder domain."
+                ),
+                "Company",
+                12,
             )
 
             score += 12
@@ -1414,16 +1486,16 @@ def run_rule_checklist(
             in FREE_EMAIL_DOMAINS
         ):
 
-            flags.append(
-                {
-                    "icon": "⚠",
-                    "title": "Personal email address",
-                    "detail": (
-                        f"The recruiter used a personal "
-                        f"email provider ({email_domain}) "
-                        "instead of a company email."
-                    ),
-                }
+            add_flag(
+                "⚠",
+                "Personal email address",
+                (
+                    f"The recruiter used a personal "
+                    f"email provider ({email_domain}) "
+                    "instead of a company email."
+                ),
+                "Contact",
+                18,
             )
 
             score += 18
@@ -1433,13 +1505,6 @@ def run_rule_checklist(
             company_host = _domain_from_url(
                 job.get(
                     "company_url",
-                    "",
-                )
-            )
-
-            page_root = _root_domain(
-                job.get(
-                    "page_domain",
                     "",
                 )
             )
@@ -1459,19 +1524,55 @@ def run_rule_checklist(
                 and email_root != company_root
             ):
 
-                flags.append(
-                    {
-                        "icon": "⚠",
-                        "title": "Recruiter email does not match company website",
-                        "detail": (
-                            f"The recruiter email uses "
-                            f"{email_domain}, while the company "
-                            f"website uses {company_host}."
-                        ),
-                    }
+                add_flag(
+                    "⚠",
+                    "Recruiter email does not match company website",
+                    (
+                        f"The recruiter email uses "
+                        f"{email_domain}, while the company "
+                        f"website uses {company_host}."
+                    ),
+                    "Contact",
+                    12,
                 )
 
                 score += 12
+
+        # Cross-check against this session's history: same recruiter
+        # contact, different employer named across checks.
+        if history:
+
+            for past in history:
+
+                past_email = (
+                    past.get("recruiter_email", "")
+                )
+
+                past_company = (
+                    past.get("company", "")
+                )
+
+                if (
+                    past_email
+                    and past_email.lower() == email.lower()
+                    and past_company
+                    and past_company.lower() != company.lower()
+                ):
+
+                    add_flag(
+                        "🚨",
+                        "Same recruiter contact used for a different company",
+                        (
+                            f"The email {email} was already seen in this "
+                            f"session under a different employer name "
+                            f"('{past_company}')."
+                        ),
+                        "Contact",
+                        25,
+                    )
+
+                    score += 25
+                    break
 
     # ------------------------------------------------------------------
     # Description
@@ -1489,15 +1590,15 @@ def run_rule_checklist(
         and description_length < 150
     ):
 
-        flags.append(
-            {
-                "icon": "⚠",
-                "title": "Very short job description",
-                "detail": (
-                    "The extracted posting contains very little "
-                    "information about the actual role."
-                ),
-            }
+        add_flag(
+            "⚠",
+            "Very short job description",
+            (
+                "The extracted posting contains very little "
+                "information about the actual role."
+            ),
+            "Description",
+            10,
         )
 
         score += 10
@@ -1514,15 +1615,15 @@ def run_rule_checklist(
 
     if urgent_hits:
 
-        flags.append(
-            {
-                "icon": "⚠",
-                "title": "Urgency language",
-                "detail": (
-                    "The posting contains language that pressures "
-                    "applicants to act immediately."
-                ),
-            }
+        add_flag(
+            "⚠",
+            "Urgency language",
+            (
+                "The posting contains language that pressures "
+                "applicants to act immediately."
+            ),
+            "Description",
+            10,
         )
 
         score += 10
@@ -1539,16 +1640,16 @@ def run_rule_checklist(
 
     if payment_hits:
 
-        flags.append(
-            {
-                "icon": "🚨",
-                "title": "Payment or sensitive-data request",
-                "detail": (
-                    f"The posting contains language associated "
-                    f"with payment or sensitive information requests "
-                    f"('{payment_hits[0]}')."
-                ),
-            }
+        add_flag(
+            "🚨",
+            "Payment or sensitive-data request",
+            (
+                f"The posting contains language associated "
+                f"with payment or sensitive information requests "
+                f"('{payment_hits[0]}')."
+            ),
+            "Description",
+            35,
         )
 
         score += 35
@@ -1582,16 +1683,16 @@ def run_rule_checklist(
 
                 if salary_number > 50000:
 
-                    flags.append(
-                        {
-                            "icon": "⚠",
-                            "title": "Potentially unrealistic salary",
-                            "detail": (
-                                "The posting combines no-experience "
-                                "requirements with a potentially high "
-                                "salary."
-                            ),
-                        }
+                    add_flag(
+                        "⚠",
+                        "Potentially unrealistic salary",
+                        (
+                            "The posting combines no-experience "
+                            "requirements with a potentially high "
+                            "salary."
+                        ),
+                        "Description",
+                        15,
                     )
 
                     score += 15
@@ -1665,16 +1766,16 @@ def run_rule_checklist(
             and not is_known_ats
         ):
 
-            flags.append(
-                {
-                    "icon": "⚠",
-                    "title": "Unverified external application link",
-                    "detail": (
-                        f"The Apply link leads to {apply_host}, "
-                        "which could not be matched to the employer "
-                        "or a recognized ATS."
-                    ),
-                }
+            add_flag(
+                "⚠",
+                "Unverified external application link",
+                (
+                    f"The Apply link leads to {apply_host}, "
+                    "which could not be matched to the employer "
+                    "or a recognized ATS."
+                ),
+                "Application",
+                10,
             )
 
             score += 10
@@ -1760,10 +1861,20 @@ IMPORTANT RULES:
 8. Consider the extraction quality. If the page was partially blocked or
    only a listing page was extracted, lower confidence and explain that.
 
+9. You will also be given a "rule_based_flags" list, produced by a separate
+   deterministic checklist that already ran on this same posting. Treat it
+   as a second opinion, not ground truth: explicitly agree or disagree with
+   each one you find material, and explain why in your findings. Do not
+   just restate it — add your own independent read of the text.
+
+10. Report how confident you are in your own risk_score, given how complete
+    and reliable the extracted data looked.
+
 Return ONLY one JSON object:
 
 {
   "risk_score": integer 0-100,
+  "ai_confidence": integer 0-100,
   "findings": [
     {
       "issue": "short title",
@@ -1777,6 +1888,7 @@ Return ONLY one JSON object:
 
 def run_ai_analysis(
     job: dict,
+    rule_flags: list = None,
 ) -> dict:
 
     client = get_groq_client()
@@ -1785,6 +1897,7 @@ def run_ai_analysis(
 
         return {
             "risk_score": None,
+            "ai_confidence": None,
             "findings": [],
             "recommendation": "",
             "error": (
@@ -1798,6 +1911,15 @@ def run_ai_analysis(
         "GROQ_MODEL",
         DEFAULT_GROQ_MODEL,
     )
+
+    rule_flags_summary = [
+        {
+            "title": f.get("title"),
+            "category": f.get("category"),
+            "severity": f.get("severity"),
+        }
+        for f in (rule_flags or [])
+    ]
 
     payload = {
         "title": job.get("title"),
@@ -1834,6 +1956,7 @@ def run_ai_analysis(
         "external_links": job.get(
             "external_links"
         ),
+        "rule_based_flags": rule_flags_summary,
     }
 
     try:
@@ -1884,6 +2007,24 @@ def run_ai_analysis(
             ),
         )
 
+        ai_confidence = parsed.get(
+            "ai_confidence",
+            None,
+        )
+
+        if ai_confidence is not None:
+
+            try:
+                ai_confidence = max(
+                    0,
+                    min(
+                        100,
+                        int(ai_confidence),
+                    ),
+                )
+            except Exception:
+                ai_confidence = None
+
         findings = (
             parsed.get(
                 "findings",
@@ -1902,6 +2043,7 @@ def run_ai_analysis(
 
         return {
             "risk_score": risk_score,
+            "ai_confidence": ai_confidence,
             "findings": findings,
             "recommendation": recommendation,
             "error": None,
@@ -1911,6 +2053,7 @@ def run_ai_analysis(
 
         return {
             "risk_score": None,
+            "ai_confidence": None,
             "findings": [],
             "recommendation": "",
             "error": (
@@ -1982,6 +2125,7 @@ def run_ai_analysis(
 
         return {
             "risk_score": None,
+            "ai_confidence": None,
             "findings": [],
             "recommendation": "",
             "error": msg,
@@ -1995,15 +2139,27 @@ def run_ai_analysis(
 def combine_scores(
     rule_score: int,
     ai_score,
+    ai_confidence=None,
     extraction_confidence: int = 100,
 ) -> int:
 
     if ai_score is None:
         return rule_score
 
+    # Weight the AI's contribution by how confident it says it is. A model
+    # that admits low confidence (e.g. because extraction was poor) should
+    # not be allowed to swing the combined score as hard as a confident one.
+    if ai_confidence is not None:
+        ai_weight = 0.55 * (ai_confidence / 100)
+        ai_weight = max(0.15, min(0.55, ai_weight))
+    else:
+        ai_weight = 0.55
+
+    rule_weight = 1 - ai_weight
+
     score = round(
-        0.45 * rule_score
-        + 0.55 * ai_score
+        rule_weight * rule_score
+        + ai_weight * ai_score
     )
 
     # If extraction is very poor, do not allow the system to confidently
@@ -2056,6 +2212,133 @@ def risk_label(
         )
 
 
+SEVERITY_COLOR = {
+    "high": "#e74c3c",
+    "medium": "#e67e22",
+    "low": "#7f8c8d",
+}
+
+
+FLAG_CATEGORY_ORDER = [
+    "Page Quality",
+    "Company",
+    "Contact",
+    "Description",
+    "Application",
+    "AI Analysis",
+]
+
+
+def render_score_gauge(
+    score: int,
+    color: str,
+) -> str:
+    """
+    A small CSS conic-gradient arc gauge. Returns raw HTML — caller is
+    responsible for passing it to st.markdown(..., unsafe_allow_html=True).
+    """
+
+    angle = round(
+        (score / 100) * 360
+    )
+
+    return f"""
+    <div style="
+        width:180px;
+        height:180px;
+        border-radius:50%;
+        margin:0 auto;
+        background:conic-gradient(
+            {color} 0deg {angle}deg,
+            #2a2a2a {angle}deg 360deg
+        );
+        display:flex;
+        align-items:center;
+        justify-content:center;
+    ">
+        <div style="
+            width:140px;
+            height:140px;
+            border-radius:50%;
+            background:#0e1117;
+            display:flex;
+            flex-direction:column;
+            align-items:center;
+            justify-content:center;
+        ">
+            <div style="font-size:38px;font-weight:700;color:{color}">
+                {score}
+            </div>
+            <div style="font-size:12px;color:#9a9a9a">out of 100</div>
+        </div>
+    </div>
+    """
+
+
+def build_text_report(entry: dict) -> str:
+    """Plain-text version of a result entry, for the download button."""
+
+    job = entry["job"]
+    ai_result = entry["ai_result"]
+
+    lines = []
+
+    lines.append("JabFraud — Fraud Risk Report")
+    lines.append("=" * 32)
+    lines.append(f"Checked: {entry.get('timestamp', '')}")
+    lines.append(f"URL: {entry.get('url', '')}")
+    lines.append("")
+    lines.append(
+        f"Final score: {entry['final_score']} / 100 "
+        f"({entry['label']})"
+    )
+    lines.append(f"Rule-based score: {entry['rule_score']} / 100")
+
+    if ai_result.get("risk_score") is not None:
+        lines.append(
+            f"AI score: {ai_result['risk_score']} / 100 "
+            f"(AI confidence: {ai_result.get('ai_confidence', '—')})"
+        )
+
+    lines.append(
+        f"Extraction confidence: {entry['confidence']}% "
+        f"(method: {entry['method']})"
+    )
+    lines.append("")
+
+    lines.append("Job Details")
+    lines.append("-" * 32)
+    lines.append(f"Title: {job.get('title') or '—'}")
+    lines.append(f"Company: {job.get('company') or '—'}")
+    lines.append(f"Location: {job.get('location') or '—'}")
+    lines.append(f"Salary: {job.get('salary') or '—'}")
+    lines.append(f"Recruiter email: {job.get('recruiter_email') or '—'}")
+    lines.append(f"Recruiter phone: {job.get('recruiter_phone') or '—'}")
+    lines.append(f"Application URL: {job.get('application_url') or '—'}")
+    lines.append("")
+
+    lines.append("Flags")
+    lines.append("-" * 32)
+
+    all_findings = entry.get("all_findings", [])
+
+    if not all_findings:
+        lines.append("No obvious warning signs were detected.")
+    else:
+        for f in all_findings:
+            lines.append(
+                f"[{f.get('category', 'General')}] "
+                f"{f.get('title', '')} — {f.get('detail', '')}"
+            )
+
+    lines.append("")
+    lines.append("Recommendation")
+    lines.append("-" * 32)
+    lines.append(entry.get("recommendation", ""))
+
+    return "\n".join(lines)
+
+
 # --------------------------------------------------------------------------
 # Streamlit UI
 # --------------------------------------------------------------------------
@@ -2067,6 +2350,19 @@ st.set_page_config(
     page_icon="🕵️",
     layout="centered",
 )
+
+
+if "history" not in st.session_state:
+    st.session_state["history"] = []
+
+if "active" not in st.session_state:
+    st.session_state["active"] = None
+
+if "_fetch_cache" not in st.session_state:
+    st.session_state["_fetch_cache"] = {}
+
+
+FETCH_CACHE_TTL_SECONDS = 300
 
 
 # --------------------------------------------------------------------------
@@ -2114,6 +2410,36 @@ with st.sidebar:
         "packages.txt file. Without it, JabFraud "
         "still works for pages readable by direct extraction."
     )
+
+    st.markdown("---")
+    st.markdown("### History")
+
+    if not st.session_state["history"]:
+
+        st.caption(
+            "Jobs you check this session will show up here."
+        )
+
+    else:
+
+        for i, entry in enumerate(
+            st.session_state["history"]
+        ):
+
+            label = (
+                f"{entry['icon']} "
+                f"{entry['job'].get('title') or entry['url']}"
+                f" — {entry['final_score']}"
+            )
+
+            if st.button(
+                label,
+                key=f"history_{i}",
+                use_container_width=True,
+            ):
+
+                st.session_state["active"] = entry
+                st.rerun()
 
 
 # --------------------------------------------------------------------------
@@ -2175,12 +2501,36 @@ if analyze_clicked:
     )
 
     # ------------------------------------------------------------------
-    # Stage 1 — Direct extraction
+    # Stage 1 — Direct extraction (with a short in-session cache so
+    # clicking Analyze again on the same URL within a few minutes
+    # doesn't re-scrape it from scratch)
     # ------------------------------------------------------------------
 
-    fetch_result = fetch_direct(
-        url
-    )
+    cache = st.session_state["_fetch_cache"]
+
+    cached = cache.get(url)
+
+    if (
+        cached
+        and time.time() - cached["cached_at"] < FETCH_CACHE_TTL_SECONDS
+    ):
+
+        progress.write(
+            "Reusing a recent result for this exact URL…"
+        )
+
+        fetch_result = cached["fetch_result"]
+
+    else:
+
+        fetch_result = fetch_direct(
+            url
+        )
+
+        cache[url] = {
+            "cached_at": time.time(),
+            "fetch_result": fetch_result,
+        }
 
     ocr_used = False
 
@@ -2406,56 +2756,34 @@ if analyze_clicked:
         job,
     )
 
-    # ------------------------------------------------------------------
-    # Listing page warning
-    # ------------------------------------------------------------------
-
-    if job.get(
+    listing_warning = job.get(
         "looks_like_listing_page"
-    ):
+    )
 
-        confidence = min(
-            confidence,
-            40,
-        )
-
-        st.warning(
-            "This looks like a job-board **listing page** "
-            "rather than one specific posting. Results may "
-            "be unreliable. Open one specific job and paste "
-            "that URL instead."
-        )
-
-    # ------------------------------------------------------------------
-    # Limited extraction warning
-    # ------------------------------------------------------------------
-
-    if (
+    limited_warning = (
         job.get("page_type")
         == "limited"
-    ):
+    )
 
-        confidence = min(
-            confidence,
-            45,
-        )
+    if listing_warning:
+        confidence = min(confidence, 40)
 
-        st.warning(
-            "Only limited job content could be extracted "
-            "from this page. The browser/screenshot fallback "
-            "may not be available on this deployment."
-        )
+    if limited_warning:
+        confidence = min(confidence, 45)
 
     # ------------------------------------------------------------------
-    # Rule analysis
+    # Rule analysis (cross-checked against this session's history)
     # ------------------------------------------------------------------
 
     progress.write(
         "Checking against the fraud checklist…"
     )
 
-    rule_score, rule_flags = (
-        run_rule_checklist(job)
+    rule_score, rule_flags = run_rule_checklist(
+        job,
+        history=[
+            e["job"] for e in st.session_state["history"]
+        ],
     )
 
     # ------------------------------------------------------------------
@@ -2467,7 +2795,8 @@ if analyze_clicked:
     )
 
     ai_result = run_ai_analysis(
-        job
+        job,
+        rule_flags=rule_flags,
     )
 
     # ------------------------------------------------------------------
@@ -2476,9 +2805,8 @@ if analyze_clicked:
 
     final_score = combine_scores(
         rule_score,
-        ai_result.get(
-            "risk_score"
-        ),
+        ai_result.get("risk_score"),
+        ai_result.get("ai_confidence"),
         confidence,
     )
 
@@ -2493,29 +2821,130 @@ if analyze_clicked:
     )
 
     # ------------------------------------------------------------------
-    # Results
+    # Assemble the findings list (rule flags + AI findings, tagged)
     # ------------------------------------------------------------------
+
+    all_findings = list(rule_flags)
+
+    for f in ai_result.get("findings", []):
+
+        all_findings.append(
+            {
+                "icon": "🤖",
+                "title": f.get("issue", "Flag"),
+                "detail": f.get("explanation", ""),
+                "category": "AI Analysis",
+                "severity": "medium",
+            }
+        )
+
+    recommendation = (
+        ai_result.get("recommendation")
+        or (
+            "Verify this position through the "
+            "company's official careers page before "
+            "providing personal information."
+        )
+    )
+
+    # ------------------------------------------------------------------
+    # Build the result entry, save to history, and make it active
+    # ------------------------------------------------------------------
+
+    entry = {
+        "url": url,
+        "timestamp": datetime.now().strftime(
+            "%Y-%m-%d %H:%M"
+        ),
+        "job": job,
+        "rule_score": rule_score,
+        "ai_result": ai_result,
+        "final_score": final_score,
+        "icon": icon,
+        "label": label,
+        "color": color,
+        "confidence": confidence,
+        "method": (
+            fetch_result.get("method", "direct")
+            + (" + OCR" if ocr_used else "")
+        ),
+        "all_findings": all_findings,
+        "recommendation": recommendation,
+        "listing_warning": listing_warning,
+        "limited_warning": limited_warning,
+    }
+
+    # De-duplicate: if this URL is already in history, replace it and
+    # move it to the top instead of growing the list forever.
+    st.session_state["history"] = [
+        e for e in st.session_state["history"]
+        if e["url"] != url
+    ]
+
+    st.session_state["history"].insert(0, entry)
+
+    # Keep the sidebar list from growing without bound.
+    st.session_state["history"] = (
+        st.session_state["history"][:20]
+    )
+
+    st.session_state["active"] = entry
+
+
+# --------------------------------------------------------------------------
+# Render whatever result is currently active (freshly analyzed, or picked
+# from history in the sidebar)
+# --------------------------------------------------------------------------
+
+active = st.session_state.get("active")
+
+if active is None:
+
+    st.caption(
+        "Paste a job posting link above and click "
+        "**Analyze Job** to get a risk report."
+    )
+
+else:
+
+    job = active["job"]
+    ai_result = active["ai_result"]
 
     st.markdown("---")
 
-    col1, col2 = st.columns(
-        [1, 2]
-    )
+    if active.get("listing_warning"):
+
+        st.warning(
+            "This looks like a job-board **listing page** "
+            "rather than one specific posting. Results may "
+            "be unreliable. Open one specific job and paste "
+            "that URL instead."
+        )
+
+    if active.get("limited_warning"):
+
+        st.warning(
+            "Only limited job content could be extracted "
+            "from this page. The browser/screenshot fallback "
+            "may not be available on this deployment."
+        )
+
+    col1, col2 = st.columns([1, 2])
 
     with col1:
 
         st.markdown(
-            f"""
-            <div style='text-align:center'>
-                <div style='font-size:56px'>{icon}</div>
-                <div style='font-size:40px;font-weight:700;color:{color}'>
-                    {final_score}
-                </div>
-                <div style='font-size:18px;font-weight:600;color:{color}'>
-                    {label}
-                </div>
-            </div>
-            """,
+            render_score_gauge(
+                active["final_score"],
+                active["color"],
+            ),
+            unsafe_allow_html=True,
+        )
+
+        st.markdown(
+            f"<div style='text-align:center;font-size:18px;"
+            f"font-weight:600;color:{active['color']}'>"
+            f"{active['icon']} {active['label']}</div>",
             unsafe_allow_html=True,
         )
 
@@ -2523,86 +2952,52 @@ if analyze_clicked:
 
         st.metric(
             "Rule-based score",
-            f"{rule_score} / 100",
+            f"{active['rule_score']} / 100",
         )
 
         st.metric(
             "AI score",
             (
                 f"{ai_result['risk_score']} / 100"
-                if ai_result.get(
-                    "risk_score"
-                )
-                is not None
+                if ai_result.get("risk_score") is not None
                 else "—"
             ),
         )
 
-        method_text = (
-            fetch_result.get(
-                "method",
-                "direct",
-            )
-        )
+        if ai_result.get("ai_confidence") is not None:
 
-        if ocr_used:
-            method_text += " + OCR"
+            st.caption(
+                f"AI self-reported confidence: "
+                f"{ai_result['ai_confidence']}%"
+            )
 
         st.caption(
             f"Extraction confidence: "
-            f"{confidence}% "
-            f"(method: {method_text})"
+            f"{active['confidence']}% "
+            f"(method: {active['method']})"
         )
 
-    # ------------------------------------------------------------------
-    # AI errors
-    # ------------------------------------------------------------------
-
-    if ai_result.get(
-        "error"
-    ):
+    if ai_result.get("error"):
 
         st.warning(
             "AI analysis unavailable:"
         )
 
         st.code(
-            ai_result[
-                "error"
-            ],
+            ai_result["error"],
             language=None,
         )
 
     # ------------------------------------------------------------------
-    # Why this score
+    # Why this score — grouped by category, color-coded by severity
     # ------------------------------------------------------------------
 
-    st.subheader(
-        "Why this score"
-    )
+    st.subheader("Why this score")
 
-    all_findings = list(
-        rule_flags
-    )
-
-    for f in ai_result.get(
-        "findings",
+    all_findings = active.get(
+        "all_findings",
         [],
-    ):
-
-        all_findings.append(
-            {
-                "icon": "⚠",
-                "title": f.get(
-                    "issue",
-                    "Flag",
-                ),
-                "detail": f.get(
-                    "explanation",
-                    "",
-                ),
-            }
-        )
+    )
 
     if not all_findings:
 
@@ -2612,75 +3007,79 @@ if analyze_clicked:
 
     else:
 
+        by_category = {}
+
         for f in all_findings:
 
-            st.markdown(
-                f"**{f['icon']} {f['title']}** — "
-                f"{f['detail']}"
-            )
+            cat = f.get("category", "General")
+            by_category.setdefault(cat, []).append(f)
+
+        ordered_categories = [
+            c for c in FLAG_CATEGORY_ORDER if c in by_category
+        ] + [
+            c for c in by_category if c not in FLAG_CATEGORY_ORDER
+        ]
+
+        for cat in ordered_categories:
+
+            with st.expander(
+                f"{cat} ({len(by_category[cat])})",
+                expanded=True,
+            ):
+
+                for f in by_category[cat]:
+
+                    sev_color = SEVERITY_COLOR.get(
+                        f.get("severity", "medium"),
+                        "#e67e22",
+                    )
+
+                    st.markdown(
+                        f"<span style='color:{sev_color};"
+                        f"font-weight:600'>{f['icon']} "
+                        f"{f['title']}</span> — {f['detail']}",
+                        unsafe_allow_html=True,
+                    )
 
     # ------------------------------------------------------------------
     # Recommendation
     # ------------------------------------------------------------------
 
-    recommendation = (
-        ai_result.get(
-            "recommendation"
-        )
-        or (
-            "Verify this position through the "
-            "company's official careers page before "
-            "providing personal information."
-        )
+    st.info(
+        f"**Recommendation:** {active['recommendation']}"
     )
 
-    st.info(
-        f"**Recommendation:** {recommendation}"
+    # ------------------------------------------------------------------
+    # Download report
+    # ------------------------------------------------------------------
+
+    st.download_button(
+        "⬇ Download report (.txt)",
+        data=build_text_report(active),
+        file_name="jabfraud_report.txt",
+        mime="text/plain",
+        use_container_width=True,
     )
 
     # ------------------------------------------------------------------
     # Job details
     # ------------------------------------------------------------------
 
-    st.subheader(
-        "Job Details"
-    )
+    st.subheader("Job Details")
 
-    d1, d2 = st.columns(
-        2
-    )
+    d1, d2 = st.columns(2)
 
     with d1:
 
-        st.markdown(
-            f"**Title:** "
-            f"{job['title'] or '—'}"
-        )
-
-        st.markdown(
-            f"**Company:** "
-            f"{job['company'] or '—'}"
-        )
-
-        st.markdown(
-            f"**Location:** "
-            f"{job['location'] or '—'}"
-        )
-
-        st.markdown(
-            f"**Salary:** "
-            f"{job['salary'] or '—'}"
-        )
-
+        st.markdown(f"**Title:** {job['title'] or '—'}")
+        st.markdown(f"**Company:** {job['company'] or '—'}")
+        st.markdown(f"**Location:** {job['location'] or '—'}")
+        st.markdown(f"**Salary:** {job['salary'] or '—'}")
         st.markdown(
             f"**Employment type:** "
             f"{job['employment_type'] or '—'}"
         )
-
-        st.markdown(
-            f"**Experience:** "
-            f"{job['experience'] or '—'}"
-        )
+        st.markdown(f"**Experience:** {job['experience'] or '—'}")
 
     with d2:
 
@@ -2688,27 +3087,22 @@ if analyze_clicked:
             f"**Recruiter email:** "
             f"{job['recruiter_email'] or '—'}"
         )
-
         st.markdown(
             f"**Recruiter phone:** "
             f"{job['recruiter_phone'] or '—'}"
         )
-
         st.markdown(
             f"**Application URL:** "
             f"{job['application_url'] or '—'}"
         )
-
         st.markdown(
             f"**Company URL:** "
             f"{job['company_url'] or '—'}"
         )
-
         st.markdown(
             f"**Page domain:** "
             f"{job['page_domain'] or '—'}"
         )
-
         st.markdown(
             f"**Page type:** "
             f"{job.get('page_type', 'unknown')}"
@@ -2721,20 +3115,12 @@ if analyze_clicked:
                 f"{' → '.join(job['redirect_chain'])}"
             )
 
-    # ------------------------------------------------------------------
-    # Skills
-    # ------------------------------------------------------------------
-
     if job["skills"]:
 
         st.markdown(
             f"**Skills mentioned:** "
             f"{', '.join(job['skills'])}"
         )
-
-    # ------------------------------------------------------------------
-    # Benefits
-    # ------------------------------------------------------------------
 
     if job["benefits"]:
 
@@ -2743,10 +3129,6 @@ if analyze_clicked:
             f"{', '.join(job['benefits'])}"
         )
 
-    # ------------------------------------------------------------------
-    # External links
-    # ------------------------------------------------------------------
-
     if job["external_links"]:
 
         with st.expander(
@@ -2754,52 +3136,22 @@ if analyze_clicked:
             f"({len(job['external_links'])})"
         ):
 
-            for link in job[
-                "external_links"
-            ]:
+            for link in job["external_links"]:
                 st.write(link)
 
-    # ------------------------------------------------------------------
-    # Screenshot
-    # ------------------------------------------------------------------
+    if job.get("screenshot"):
 
-    if job.get(
-        "screenshot"
-    ):
-
-        st.subheader(
-            "Page Evidence"
-        )
+        st.subheader("Page Evidence")
 
         st.image(
             job["screenshot"],
-            caption=(
-                "Captured screenshot of the job page"
-            ),
+            caption="Captured screenshot of the job page",
             use_container_width=True,
         )
 
-    # ------------------------------------------------------------------
-    # Raw text
-    # ------------------------------------------------------------------
-
-    with st.expander(
-        "Raw extracted text"
-    ):
+    with st.expander("Raw extracted text"):
 
         st.text(
             job["raw_text"][:5000]
             or "No text extracted."
         )
-
-
-# --------------------------------------------------------------------------
-# Initial state
-# --------------------------------------------------------------------------
-
-else:
-
-    st.caption(
-        "Paste a job posting link above and click "
-        "**Analyze Job** to get a risk report."
-    )
